@@ -387,12 +387,10 @@ def resume_from_batch(batch_id: str, output_path: str, client: anthropic.Anthrop
     
 def process_files_in_parallel(input_path: str, client: anthropic.Anthropic, notifier: GotifyNotifier):
     """Process multiple markdown files in parallel using batch API"""
-    # Get all markdown files
     files = get_text_files(input_path)
     if not files:
-        raise ValueError(f"No markdown files found in {input_path}")
+        raise ValueError(f"No text files found in {input_path}")
     
-    # Initialize processing status
     processing_status = ProcessingStatus()
     last_notification_time = time.time()
     
@@ -403,13 +401,12 @@ def process_files_in_parallel(input_path: str, client: anthropic.Anthropic, noti
             with open(filepath, 'r', encoding='utf-8') as f:
                 content = f.read()
             
-            # Split content into chunks
-            chunks = chunk_markdown(content)  # Using existing chunk_markdown function
+            chunks = chunk_markdown(content)
             if not chunks:
                 raise ValueError("No chunks were created from the input file")
             
-            # Submit batches for this file
-            batches = submit_batches(chunks, client, filepath)
+            # Pass notifier to submit_batches
+            batches = submit_batches(chunks, client, filepath, notifier)
             processing_status.active_batches[filepath] = batches
             
             print(f"Submitted {len(batches)} batches for {filepath}")
@@ -597,9 +594,9 @@ def main():
             final_msg = (
                 f"Processing complete for {args.input}\n"
                 f"Successfully processed: {summary['completed_files']}/{summary['total_files']} files\n"
-                f"Failed files: {len(summary['failed_files'])}\n"
+                f"Failed files: {summary['failed_files']}\n"  # failed_files is already a count in the summary dict
             )
-            if summary['failed_files']:
+            if summary['failures']:  # Use 'failures' key for the dict of failed files
                 final_msg += "\nFailed files:\n" + "\n".join(
                     f"- {filepath}: {error}" 
                     for filepath, error in summary['failures'].items()
