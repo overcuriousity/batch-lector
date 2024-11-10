@@ -5,9 +5,10 @@ import os
 import requests
 import argparse
 import traceback
+from pathlib import Path
 from dotenv import load_dotenv
-from typing import List, Dict, Set
-from dataclasses import dataclass
+from typing import List, Dict, Set, Optional
+from dataclasses import dataclass, field
 from anthropic.types.beta.message_create_params import MessageCreateParamsNonStreaming
 from anthropic.types.beta.messages.batch_create_params import Request
 
@@ -17,24 +18,29 @@ load_dotenv()
 class BatchStatus:
     batch_id: str
     chunks: List[Dict[str, str]]
+    input_file: str  # Track which file this batch belongs to
     status: str = "in_progress"
-    results: Dict[str, str] = None
+    results: Dict[str, str] = field(default_factory=dict)
 
-    def __init__(self, batch_id: str, chunks: List[Dict[str, str]], status: str = "in_progress"):
-        self.batch_id = batch_id
-        self.chunks = chunks
-        self.status = status
-        self.results = {} if self.results is None else self.results
-    
+@dataclass
+class ProcessingStatus:
+    """Track processing status across multiple files and their batches"""
+    active_batches: Dict[str, List[BatchStatus]] = field(default_factory=dict)  # file -> batches
+    completed_files: Set[str] = field(default_factory=set)
+    failed_files: Dict[str, str] = field(default_factory=dict)  # file -> error message
+
 
 class GotifyNotifier:
-    def __init__(self, base_url: str = "https://push.example.de", token: str = "AQk4vAALOrMNRJi"):
-        self.base_url = base_url.rstrip('/')
-        self.token = token
+    def __init__(self, base_url: str = None, token: str = None):
+        self.base_url = (base_url or os.getenv('GOTIFY_URL', 'https://gotify.example.com')).rstrip('/')
+        self.token = token or os.getenv('GOTIFY_TOKEN')
+        
+        if not self.token:
+            raise ValueError("No Gotify token provided. Set GOTIFY_TOKEN in .env file or pass via --gotify-token")
         
     def send_notification(self, title: str, message: str, priority: int = 5):
         """Send notification via Gotify"""
-        url = f"{self.base_url}/message"
+        url = self.base_url
         try:
             response = requests.post(
                 url,
@@ -77,6 +83,143 @@ def test_connections(client: anthropic.Anthropic, notifier: GotifyNotifier):
     
     return success
 
+def is_text_file(file_path: Path) -> bool:
+    """
+    Check if a file is text-based by attempting to read it as text.
+    Also checks for common text file extensions as a fast path.
+    """
+    # Common text file extensions (fast path)
+    text_extensions = {
+        '.txt', '.md', '.json', '.csv', '.tex', '.rst', 
+        '.asc', '.text', '.rtf', '.adoc', '.asciidoc'
+    }
+    
+    if file_path.suffix.lower() in text_extensions:
+        return True
+        
+    # Try reading the file as text
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            # Read first 512 bytes to check if it's text
+            sample = f.read(512)
+            # Check if sample contains mostly printable characters
+            printable_ratio = sum(c.isprintable() or c.isspace() for c in sample) / len(sample)
+            return printable_ratio > 0.9  # If 90% of characters are printable, consider it text
+    except (UnicodeDecodeError, IOError):
+        return False
+
+def get_text_files(input_path: str) -> List[str]:
+    """Get all text files from input path (file or directory)"""
+    input_path = Path(input_path)
+    
+    if input_path.is_file():
+        return [str(input_path)] if is_text_file(input_path) else []
+    elif input_path.is_dir():
+        text_files = []
+        # Walk through directory recursively
+        for path in input_path.rglob('*'):
+            if path.is_file() and is_text_file(path):
+                text_files.append(str(path))
+        return text_files
+    return []
+
+def get_batch_status_summary(processing_status: ProcessingStatus, client: anthropic.Anthropic) -> Dict:
+    """Get a comprehensive summary of all batch processing status"""
+    summary = {
+        "files": {
+            "total": len(processing_status.active_batches) + len(processing_status.completed_files) + len(processing_status.failed_files),
+            "in_progress": len(processing_status.active_batches),
+            "completed": len(processing_status.completed_files),
+            "failed": len(processing_status.failed_files)
+        },
+        "batches": {
+            "total": sum(len(batches) for batches in processing_status.active_batches.values()),
+            "in_progress": 0,
+            "completed": 0,
+            "error": 0
+        },
+        "requests": {
+            "total": 0,
+            "processing": 0,
+            "succeeded": 0,
+            "errored": 0,
+            "canceled": 0,
+            "expired": 0
+        },
+        "batch_details": {}  # Store details for each batch
+    }
+    
+    # Collect status for all active batches
+    for filepath, batches in processing_status.active_batches.items():
+        file_batches = []
+        for batch in batches:
+            try:
+                status = client.beta.messages.batches.retrieve(batch.batch_id)
+                if status.processing_status == "ended":
+                    summary["batches"]["completed"] += 1
+                else:
+                    summary["batches"]["in_progress"] += 1
+                
+                # Update request counts
+                for count_type, count in status.request_counts.items():
+                    summary["requests"][count_type] += count
+                
+                # Store batch details
+                file_batches.append({
+                    "id": batch.batch_id,
+                    "status": status.processing_status,
+                    "requests": status.request_counts
+                })
+            except Exception as e:
+                summary["batches"]["error"] += 1
+                file_batches.append({
+                    "id": batch.batch_id,
+                    "status": "error",
+                    "error": str(e)
+                })
+        
+        summary["batch_details"][filepath] = file_batches
+    
+    return summary
+
+def format_status_message(summary: Dict) -> str:
+    """Format status summary into a readable message"""
+    message = [
+        "Current Processing Status:",
+        "\nFiles:",
+        f"- Total: {summary['files']['total']}",
+        f"- In Progress: {summary['files']['in_progress']}",
+        f"- Completed: {summary['files']['completed']}",
+        f"- Failed: {summary['files']['failed']}",
+        "\nBatches:",
+        f"- Total: {summary['batches']['total']}",
+        f"- In Progress: {summary['batches']['in_progress']}",
+        f"- Completed: {summary['batches']['completed']}",
+        f"- Error: {summary['batches']['error']}",
+        "\nRequests:",
+        f"- Total: {summary['requests']['total']}",
+        f"- Processing: {summary['requests']['processing']}",
+        f"- Succeeded: {summary['requests']['succeeded']}",
+        f"- Failed: {summary['requests']['errored']}",
+        f"- Canceled/Expired: {summary['requests']['canceled'] + summary['requests']['expired']}",
+        "\nActive Batch Details:"
+    ]
+    
+    for filepath, batches in summary["batch_details"].items():
+        message.append(f"\nFile: {Path(filepath).name}")
+        for batch in batches:
+            status_str = batch['status'].upper()
+            if batch['status'] == "error":
+                message.append(f"- Batch {batch['id']}: {status_str} ({batch['error']})")
+            else:
+                req_counts = batch['requests']
+                message.append(
+                    f"- Batch {batch['id']}: {status_str} "
+                    f"({req_counts['succeeded']}/{sum(req_counts.values())} requests completed)"
+                )
+    
+    return "\n".join(message)
+    
 def chunk_markdown(content: str, chunk_size: int = 50) -> List[Dict[str, str]]:
     """Split markdown content into chunks while preserving paragraph integrity."""
     lines = content.split('\n')
@@ -126,7 +269,7 @@ def create_batch_requests(chunks: List[Dict[str, str]], model: str = "claude-3-5
         for i, chunk in enumerate(chunks)
     ]
 
-def submit_batches(chunks: List[Dict[str, str]], client: anthropic.Anthropic, max_batch_size: int = 10000) -> List[BatchStatus]:
+def submit_batches(chunks: List[Dict[str, str]], client: anthropic.Anthropic, input_file: str, notifier: GotifyNotifier, max_batch_size: int = 10000) -> List[BatchStatus]:
     """Submit all chunks in multiple batches if needed."""
     batches = []
     
@@ -139,282 +282,18 @@ def submit_batches(chunks: List[Dict[str, str]], client: anthropic.Anthropic, ma
             message_batch = client.beta.messages.batches.create(requests=batch_requests)
             batches.append(BatchStatus(
                 batch_id=message_batch.id,
-                chunks=batch_chunks
+                chunks=batch_chunks,
+                input_file=input_file  # Add input_file parameter
             ))
-            print(f"Submitted batch {message_batch.id} with {len(batch_chunks)} chunks")
+            msg = f"Submitted batch {message_batch.id} with {len(batch_chunks)} chunks for {input_file}"
+            print(msg)
+            notifier.send_notification("Batch Creation", msg, priority=5)
         except Exception as e:
-            print(f"Error submitting batch: {str(e)}")
+            print(f"Error submitting batch for {input_file}: {str(e)}")
             raise
             
     return batches
 
-def get_batch_status_summary(batches: List[BatchStatus], client: anthropic.Anthropic) -> Dict:
-    """Get a summary of current batch processing status."""
-    status_counts = {
-        "total": len(batches),
-        "completed": 0,
-        "in_progress": 0,
-        "error": 0
-    }
-    
-    request_counts = {
-        "total": 0,
-        "processing": 0,
-        "succeeded": 0,
-        "errored": 0,
-        "canceled": 0,
-        "expired": 0
-    }
-    
-    for batch in batches:
-        if batch.status == "ended":
-            status_counts["completed"] += 1
-        else:
-            try:
-                status = client.beta.messages.batches.retrieve(batch.batch_id)
-                if status.processing_status == "ended":
-                    status_counts["completed"] += 1
-                else:
-                    status_counts["in_progress"] += 1
-                
-                # Update request counts WITHOUT double counting total
-                for count_type, count in status.request_counts.items():
-                    request_counts[count_type] += count
-                request_counts["total"] = sum(request_counts[k] for k in ["processing", "succeeded", "errored", "canceled", "expired"])
-            except Exception:
-                status_counts["error"] += 1
-    
-    return {
-        "batch_status": status_counts,
-        "request_counts": request_counts
-    }
-
-def check_batch_statuses(batches: List[BatchStatus], client: anthropic.Anthropic, notifier: GotifyNotifier, 
-                        last_notification_time: float) -> tuple[Set[str], float]:
-    """Check status of all batches and collect results from completed ones."""
-    completed_batch_ids = set()
-    current_time = time.time()
-    
-    # Send hourly status update
-    if current_time - last_notification_time >= 3600:
-        status_summary = get_batch_status_summary(batches, client)
-        batch_stats = status_summary["batch_status"]
-        req_stats = status_summary["request_counts"]
-        
-        status_message = (
-            f"Batch Processing Status:\n"
-            f"Batches: {batch_stats['completed']}/{batch_stats['total']} completed\n"
-            f"Requests: {req_stats['succeeded']}/{req_stats['total']} succeeded\n"
-            f"In Progress: {req_stats['processing']} requests\n"
-            f"Errors: {req_stats['errored']} requests\n"
-            f"Canceled/Expired: {req_stats['canceled'] + req_stats['expired']} requests"
-        )
-        
-        notifier.send_notification(
-            "Hourly Status Update",
-            status_message,
-            priority=5
-        )
-        last_notification_time = current_time
-    
-    # Check individual batch status
-    for batch in batches:
-        if batch.status != "ended":
-            try:
-                status = client.beta.messages.batches.retrieve(batch.batch_id)
-                if status.processing_status == "ended":
-                    error_count = 0
-                    # Collect results
-                    try:
-                        for result in client.beta.messages.batches.results(batch.batch_id):
-                            # Access result attributes using dot notation instead of dictionary access
-                            chunk_id = result.custom_id
-                            if result.result.type == "succeeded":
-                                # Access the content correctly based on the API response structure
-                                message_content = result.result.message.content[0].text
-                                batch.results[chunk_id] = message_content
-                            else:
-                                error_count += 1
-                                error_type = result.result.type
-                                error_details = getattr(result.result.error, 'message', 'No details available')
-                                error_msg = (
-                                    f"Error processing chunk {chunk_id} in batch {batch.batch_id}\n"
-                                    f"Error Type: {error_type}\n"
-                                    f"Details: {error_details}\n"
-                                    f"Start Line: {chunk_id.split('_')[-1]}"
-                                )
-                                print(error_msg)
-                                notifier.send_notification(
-                                    f"Processing Error - Chunk {chunk_id}",
-                                    error_msg,
-                                    priority=8
-                                )
-                    except Exception as e:
-                        error_msg = (
-                            f"Error processing results for batch {batch.batch_id}:\n"
-                            f"Error Type: {type(e).__name__}\n"
-                            f"Details: {str(e)}"
-                        )
-                        print(error_msg)
-                        notifier.send_notification(
-                            "Results Processing Error",
-                            error_msg,
-                            priority=9
-                        )
-                        continue
-                    
-                    # Send batch completion notification with error summary
-                    if error_count > 0:
-                        notifier.send_notification(
-                            f"Batch {batch.batch_id} Completed with Errors",
-                            f"Batch completed with {error_count} failed chunks out of {len(batch.chunks)}",
-                            priority=7
-                        )
-                    
-                    batch.status = "ended"
-                    completed_batch_ids.add(batch.batch_id)
-                    print(f"Batch {batch.batch_id} completed")
-            except Exception as e:
-                error_msg = (
-                    f"Error checking batch {batch.batch_id}:\n"
-                    f"Error Type: {type(e).__name__}\n"
-                    f"Details: {str(e)}"
-                )
-                print(error_msg)
-                notifier.send_notification(
-                    "Batch Status Check Error",
-                    error_msg,
-                    priority=9
-                )
-                
-    return completed_batch_ids, last_notification_time
-
-def process_markdown_in_parallel(filepath: str, client: anthropic.Anthropic, notifier: GotifyNotifier):
-    """Process markdown file by submitting all chunks in parallel batches."""
-    output_filepath = None
-    try:
-        # Read markdown file
-        with open(filepath, 'r', encoding='utf-8') as f:
-            content = f.read()
-    except Exception as e:
-        error_msg = (
-            f"Failed to read input file: {filepath}\n"
-            f"Error Type: {type(e).__name__}\n"
-            f"Details: {str(e)}\n"
-            f"Traceback: {traceback.format_exc()}"
-        )
-        notifier.send_notification("File Read Error", error_msg, priority=10)
-        raise
-
-    try:
-        # Split content into chunks
-        chunks = chunk_markdown(content)
-        if not chunks:
-            raise ValueError("No chunks were created from the input file")
-            
-        total_chunks = len(chunks)
-        print(f"Split content into {total_chunks} chunks")
-        notifier.send_notification(
-            "Processing Started",
-            f"Started processing markdown file with {total_chunks} chunks",
-            priority=7
-        )
-        
-        # Submit all chunks in batches
-        batches = submit_batches(chunks, client)
-        if not batches:
-            raise ValueError("No batches were created from the chunks")
-            
-        total_batches = len(batches)
-        print(f"Submitted {total_batches} batches")
-    
-        # Initialize status tracking
-        completed_batches = set()
-        last_notification_time = time.time()
-        
-        # Send initial status
-        status_summary = get_batch_status_summary(batches, client)
-        initial_status = (
-            f"Initial Processing Status:\n"
-            f"Total Batches: {status_summary['batch_status']['total']}\n"
-            f"Total Requests: {status_summary['request_counts']['total']}\n"
-            f"Processing Started: {time.strftime('%Y-%m-%d %H:%M:%S')}"
-        )
-        notifier.send_notification("Processing Started", initial_status, priority=7)
-        
-        # Monitor batch completion with timeout
-        start_time = time.time()
-        max_runtime = 24 * 60 * 60  # 24 hours in seconds
-        
-        while len(completed_batches) < total_batches:
-            if time.time() - start_time > max_runtime:
-                raise TimeoutError("Processing exceeded maximum runtime of 24 hours")
-                
-            newly_completed, last_notification_time = check_batch_statuses(
-                batches, client, notifier, last_notification_time
-            )
-            completed_batches.update(newly_completed)
-            
-            if len(completed_batches) < total_batches:
-                print(f"Completed {len(completed_batches)}/{total_batches} batches...")
-                time.sleep(60)
-        
-        # Combine results from all batches
-        all_results = []
-        for batch in batches:
-            if not batch.results:
-                raise ValueError(f"Batch {batch.batch_id} has no results")
-            for chunk_id, content in batch.results.items():
-                all_results.append({"chunk_id": chunk_id, "content": content})
-        
-        if not all_results:
-            raise ValueError("No results were collected from completed batches")
-        
-        # Sort and combine results
-        all_results.sort(key=lambda x: int(x["chunk_id"].split("_")[1]))
-        processed_content = "\n".join(r["content"] for r in all_results)
-        
-        # Save processed content
-        output_filepath = filepath.replace('.md', '_processed.md')
-        with open(output_filepath, 'w', encoding='utf-8') as f:
-            f.write(processed_content)
-        
-        notifier.send_notification(
-            "Processing Complete",
-            f"Successfully processed {len(all_results)} chunks from {total_batches} batches. Output saved to: {output_filepath}",
-            priority=7
-        )
-        
-        return output_filepath
-
-    except Exception as e:
-        error_msg = (
-            f"Failed during batch processing\n"
-            f"Error Type: {type(e).__name__}\n"
-            f"Details: {str(e)}\n"
-            f"Traceback: {traceback.format_exc()}\n"
-            f"Stage: {'chunk creation' if 'batches' not in locals() else 'batch submission'}"
-        )
-        notifier.send_notification("Processing Error", error_msg, priority=10)
-        
-        # Try to save partial results if available
-        if 'all_results' in locals() and all_results:
-            try:
-                partial_output = filepath.replace('.md', '_partial_processed.md')
-                with open(partial_output, 'w', encoding='utf-8') as f:
-                    f.write("\n".join(r["content"] for r in all_results))
-                notifier.send_notification(
-                    "Partial Results Saved",
-                    f"Saved partial results to: {partial_output}",
-                    priority=7
-                )
-            except Exception as save_error:
-                notifier.send_notification(
-                    "Failed to Save Partial Results",
-                    f"Error: {str(save_error)}",
-                    priority=8
-                )
-        raise
     
 def resume_from_batch(batch_id: str, output_path: str, client: anthropic.Anthropic, notifier: GotifyNotifier):
     """Resume processing from an existing batch ID."""
@@ -505,16 +384,154 @@ def resume_from_batch(batch_id: str, output_path: str, client: anthropic.Anthrop
         print(error_msg)
         notifier.send_notification("Batch Resume Error", error_msg, priority=10)
         raise
+    
+def process_files_in_parallel(input_path: str, client: anthropic.Anthropic, notifier: GotifyNotifier):
+    """Process multiple markdown files in parallel using batch API"""
+    # Get all markdown files
+    files = get_text_files(input_path)
+    if not files:
+        raise ValueError(f"No markdown files found in {input_path}")
+    
+    # Initialize processing status
+    processing_status = ProcessingStatus()
+    last_notification_time = time.time()
+    
+    # Start processing each file
+    for filepath in files:
+        try:
+            print(f"Starting processing of {filepath}")
+            with open(filepath, 'r', encoding='utf-8') as f:
+                content = f.read()
+            
+            # Split content into chunks
+            chunks = chunk_markdown(content)  # Using existing chunk_markdown function
+            if not chunks:
+                raise ValueError("No chunks were created from the input file")
+            
+            # Submit batches for this file
+            batches = submit_batches(chunks, client, filepath)
+            processing_status.active_batches[filepath] = batches
+            
+            print(f"Submitted {len(batches)} batches for {filepath}")
+        except Exception as e:
+            error_msg = f"Failed to process {filepath}: {str(e)}"
+            processing_status.failed_files[filepath] = error_msg
+            notifier.send_notification(
+                "File Processing Error",
+                error_msg,
+                priority=8
+            )
+    
+    # Monitor all batches
+    start_time = time.time()
+    max_runtime = 24 * 60 * 60  # 24 hours in seconds
+    
+    while processing_status.active_batches:
+        if time.time() - start_time > max_runtime:
+            raise TimeoutError("Processing exceeded maximum runtime of 24 hours")
+        
+        # Send hourly status update
+        current_time = time.time()
+        if current_time - last_notification_time >= 3600:
+            summary = get_batch_status_summary(processing_status, client)
+            status_message = format_status_message(summary)
+            notifier.send_notification(
+                "Hourly Status Update",
+                status_message,
+                priority=5
+            )
+            last_notification_time = current_time
+        
+        # Check each file's batches
+        for filepath in list(processing_status.active_batches.keys()):
+            try:
+                file_completed = True
+                all_results = []
+                
+                for batch in processing_status.active_batches[filepath]:
+                    if batch.status != "ended":
+                        status = client.beta.messages.batches.retrieve(batch.batch_id)
+                        if status.processing_status == "ended":
+                            # Process batch results
+                            try:
+                                for result in client.beta.messages.batches.results(batch.batch_id):
+                                    chunk_id = result.custom_id
+                                    if result.result.type == "succeeded":
+                                        message_content = result.result.message.content[0].text
+                                        batch.results[chunk_id] = message_content
+                                    else:
+                                        error_msg = f"Error in chunk {chunk_id} of {filepath}: {result.result.type}"
+                                        print(error_msg)
+                                batch.status = "ended"
+                            except Exception as e:
+                                print(f"Error processing batch {batch.batch_id} results: {str(e)}")
+                                file_completed = False
+                        else:
+                            file_completed = False
+                
+                if file_completed:
+                    # Combine all batch results for this file
+                    all_results = []
+                    for batch in processing_status.active_batches[filepath]:
+                        for chunk_id, content in batch.results.items():
+                            all_results.append({"chunk_id": chunk_id, "content": content})
+                    
+                    # Sort and save results
+                    all_results.sort(key=lambda x: int(x["chunk_id"].split("_")[1]))
+                    processed_content = "\n".join(r["content"] for r in all_results)
+                    
+                    output_filepath = str(Path(filepath).with_suffix('')) + '_processed.md'
+                    with open(output_filepath, 'w', encoding='utf-8') as f:
+                        f.write(processed_content)
+                    
+                    processing_status.completed_files.add(filepath)
+                    del processing_status.active_batches[filepath]
+                    
+                    notifier.send_notification(
+                        "File Processing Complete",
+                        f"Successfully processed {filepath}",
+                        priority=7
+                    )
+            except Exception as e:
+                error_msg = f"Error processing {filepath}: {str(e)}"
+                processing_status.failed_files[filepath] = error_msg
+                del processing_status.active_batches[filepath]
+                notifier.send_notification(
+                    "File Processing Error",
+                    error_msg,
+                    priority=8
+                )
+        
+        time.sleep(60)
+    
+    # Send final summary
+    final_summary = {
+        "total_files": len(files),
+        "completed_files": len(processing_status.completed_files),
+        "failed_files": len(processing_status.failed_files),
+        "failures": processing_status.failed_files
+    }
+    
+    notifier.send_notification(
+        "Processing Complete",
+        f"Processed {final_summary['completed_files']}/{final_summary['total_files']} files successfully",
+        priority=7
+    )
+    
+    return final_summary
 
 def main():
-    parser = argparse.ArgumentParser(description='Process markdown files using Anthropic API with notifications')
-    parser.add_argument('--input', type=str, required=True, help='Input markdown file path')
+    parser = argparse.ArgumentParser(description='Process markdown and text files using Anthropic API with notifications')
+    parser.add_argument('--input', type=str, required=True, help='Input file or directory path')
     parser.add_argument('--dry-run', action='store_true', help='Test connections without processing')
-    parser.add_argument('--gotify-url', type=str, default='https://push.example.de', help='Gotify server URL')
-    parser.add_argument('--gotify-token', type=str, help='Gotify notification token')
-    parser.add_argument('--api-key', type=str, help='Anthropic API key (alternatively use ANTHROPIC_API_KEY in .env file)')
+    parser.add_argument('--gotify-url', type=str, help='Gotify server URL (overrides .env)')
+    parser.add_argument('--gotify-token', type=str, help='Gotify notification token (overrides .env)')
+    parser.add_argument('--api-key', type=str, help='Anthropic API key (overrides .env)')
     parser.add_argument('--resume-batch', type=str, help='Resume processing from an existing batch ID')
     args = parser.parse_args()
+
+    # Load environment variables at the start
+    load_dotenv(override=True)
 
     client = None
     notifier = None
@@ -523,21 +540,28 @@ def main():
         # Validate input file exists
         if not os.path.exists(args.input):
             raise FileNotFoundError(f"Input file not found: {args.input}")
+        
+        # Initialize notifier first to ensure notifications work
+        notifier = GotifyNotifier(
+            base_url=args.gotify_url,  # Will use .env value if None
+            token=args.gotify_token    # Will use .env value if None
+        )
+
+        # Test notification immediately
+        if not notifier.send_notification(
+            "Script Started",
+            f"Starting processing of files in {args.input}",
+            priority=5
+        ):
+            raise ValueError("Failed to send initial notification - check Gotify settings")
             
-        # Setup API key with priority:
-        # 1. Command line argument
-        # 2. Environment variable from .env file
-        # 3. System environment variable
+        # Setup API key
         api_key = args.api_key or os.getenv('ANTHROPIC_API_KEY')
         if not api_key:
-            raise ValueError("No API key provided. Either set ANTHROPIC_API_KEY in .env file or use --api-key argument")
+            raise ValueError("No API key provided. Set ANTHROPIC_API_KEY in .env file or pass via --api-key")
         
-        # Initialize clients
+        # Initialize Anthropic client
         client = anthropic.Anthropic(api_key=api_key)
-        notifier = GotifyNotifier(
-            base_url=args.gotify_url,
-            token=args.gotify_token or os.getenv('GOTIFY_TOKEN')
-        )
 
         if args.dry_run:
             print("Running in dry-run mode...")
@@ -560,11 +584,32 @@ def main():
 
         if args.resume_batch:
             output_file = resume_from_batch(args.resume_batch, args.input, client, notifier)
+            print(f"Resume processing complete. Output saved to: {output_file}")
         else:
-            output_file = process_markdown_in_parallel(args.input, client, notifier)
+            summary = process_files_in_parallel(args.input, client, notifier)
+            print(f"Processing complete. Successfully processed {summary['completed_files']}/{summary['total_files']} files")
+            if summary['failed_files']:
+                print("\nFailed files:")
+                for filepath, error in summary['failures'].items():
+                    print(f"- {filepath}: {error}")
+                    
+            # Send final notification with summary
+            final_msg = (
+                f"Processing complete for {args.input}\n"
+                f"Successfully processed: {summary['completed_files']}/{summary['total_files']} files\n"
+                f"Failed files: {len(summary['failed_files'])}\n"
+            )
+            if summary['failed_files']:
+                final_msg += "\nFailed files:\n" + "\n".join(
+                    f"- {filepath}: {error}" 
+                    for filepath, error in summary['failures'].items()
+                )
+            notifier.send_notification(
+                "Processing Complete",
+                final_msg,
+                priority=7
+            )
             
-        print(f"Processing complete. Output saved to: {output_file}")
-        
     except Exception as e:
         error_msg = (
             f"Fatal error during script execution:\n"
@@ -584,10 +629,20 @@ def main():
         
         sys.exit(1)  # Exit with error code
     finally:
+        # Send final notification
+        if notifier:
+            try:
+                notifier.send_notification(
+                    "Script Completed",
+                    "Processing has finished (success or failure).",
+                    priority=5
+                )
+            except:
+                pass
+            
         # Cleanup if needed
         if client:
-            # Any cleanup needed for the client
-            pass
+            pass  # Any cleanup needed for the client
 
 if __name__ == "__main__":
     main()
