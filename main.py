@@ -5,11 +5,13 @@ import os
 import requests
 import argparse
 import traceback
+from dotenv import load_dotenv
 from typing import List, Dict, Set
 from dataclasses import dataclass
 from anthropic.types.beta.message_create_params import MessageCreateParamsNonStreaming
 from anthropic.types.beta.messages.batch_create_params import Request
 
+load_dotenv()
 
 @dataclass
 class BatchStatus:
@@ -104,9 +106,10 @@ def chunk_markdown(content: str, chunk_size: int = 50) -> List[Dict[str, str]]:
 
 def create_batch_requests(chunks: List[Dict[str, str]], model: str = "claude-3-5-haiku-20241022") -> List[Request]:
     """Create batch requests for markdown processing."""
-    system_prompt = """You are an expert at fixing markdown formatting while preserving the original content. 
+    # Get system prompt from environment variable, with a fallback default
+    system_prompt = os.getenv('SYSTEM_PROMPT', """You are an expert at fixing markdown formatting while preserving the original content. 
     Fix only structural markdown issues, hyphenation errors, and formatting. DO NOT change or translate the German text content.
-    Fix all original line breaks and paragraph structures. Return only the fixed markdown without explanations or annotations. Remove any Footnotes which might interfere with the text. Don´t change any image references."""
+    Fix all original line breaks and paragraph structures. Return only the fixed markdown without explanations or annotations. Remove any Footnotes which might interfere with the text. Don´t change any image references.""")
     
     return [
         Request(
@@ -114,7 +117,7 @@ def create_batch_requests(chunks: List[Dict[str, str]], model: str = "claude-3-5
             params=MessageCreateParamsNonStreaming(
                 model=model,
                 max_tokens=4096,
-                system=system_prompt,  # System prompt as top-level parameter
+                system=system_prompt,
                 messages=[
                     {"role": "user", "content": chunk['content']}
                 ]
@@ -509,7 +512,7 @@ def main():
     parser.add_argument('--dry-run', action='store_true', help='Test connections without processing')
     parser.add_argument('--gotify-url', type=str, default='https://push.example.de', help='Gotify server URL')
     parser.add_argument('--gotify-token', type=str, help='Gotify notification token')
-    parser.add_argument('--api-key', type=str, help='Anthropic API key (alternatively use ANTHROPIC_API_KEY env variable)')
+    parser.add_argument('--api-key', type=str, help='Anthropic API key (alternatively use ANTHROPIC_API_KEY in .env file)')
     parser.add_argument('--resume-batch', type=str, help='Resume processing from an existing batch ID')
     args = parser.parse_args()
 
@@ -521,10 +524,13 @@ def main():
         if not os.path.exists(args.input):
             raise FileNotFoundError(f"Input file not found: {args.input}")
             
-        # Setup API key
+        # Setup API key with priority:
+        # 1. Command line argument
+        # 2. Environment variable from .env file
+        # 3. System environment variable
         api_key = args.api_key or os.getenv('ANTHROPIC_API_KEY')
         if not api_key:
-            raise ValueError("No API key provided. Either set ANTHROPIC_API_KEY environment variable or use --api-key argument")
+            raise ValueError("No API key provided. Either set ANTHROPIC_API_KEY in .env file or use --api-key argument")
         
         # Initialize clients
         client = anthropic.Anthropic(api_key=api_key)
