@@ -161,15 +161,31 @@ def get_batch_status_summary(processing_status: ProcessingStatus, client: anthro
                 else:
                     summary["batches"]["in_progress"] += 1
                 
-                # Update request counts
-                for count_type, count in status.request_counts.items():
-                    summary["requests"][count_type] += count
+                # Update request counts - accessing as attributes instead of dict items
+                summary["requests"]["processing"] += status.request_counts.processing
+                summary["requests"]["succeeded"] += status.request_counts.succeeded
+                summary["requests"]["errored"] += status.request_counts.errored
+                summary["requests"]["canceled"] += status.request_counts.canceled
+                summary["requests"]["expired"] += status.request_counts.expired
+                summary["requests"]["total"] += (
+                    status.request_counts.processing +
+                    status.request_counts.succeeded +
+                    status.request_counts.errored +
+                    status.request_counts.canceled +
+                    status.request_counts.expired
+                )
                 
                 # Store batch details
                 file_batches.append({
                     "id": batch.batch_id,
                     "status": status.processing_status,
-                    "requests": status.request_counts
+                    "requests": {
+                        "processing": status.request_counts.processing,
+                        "succeeded": status.request_counts.succeeded,
+                        "errored": status.request_counts.errored,
+                        "canceled": status.request_counts.canceled,
+                        "expired": status.request_counts.expired
+                    }
                 })
             except Exception as e:
                 summary["batches"]["error"] += 1
@@ -214,9 +230,10 @@ def format_status_message(summary: Dict) -> str:
                 message.append(f"- Batch {batch['id']}: {status_str} ({batch['error']})")
             else:
                 req_counts = batch['requests']
+                total_requests = sum(req_counts.values())
                 message.append(
                     f"- Batch {batch['id']}: {status_str} "
-                    f"({req_counts['succeeded']}/{sum(req_counts.values())} requests completed)"
+                    f"({req_counts['succeeded']}/{total_requests} requests completed)"
                 )
     
     return "\n".join(message)
