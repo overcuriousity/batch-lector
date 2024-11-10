@@ -1,116 +1,151 @@
-# batch-lector
+# OCR Markdown Processing Tool
 
-# Markdown Batch Processor
-
-A robust Python script for processing large markdown files using Anthropic's Claude API Batching feature. Specifically designed for fixing markdown formatting and structural issues in OCR-scanned documents while preserving the original content.
+A Python tool for processing and fixing OCR-generated markdown files from German texts using Anthropic's Batch API. This tool specifically handles structural and formatting issues while preserving the original German content.
 
 ## Features
 
-- **Batch Processing**: Process large markdown files in chunks of up to 10,000 requests per batch
-- **Cost-Efficient**: Utilizes Anthropic's batch processing API for 50% cost reduction
-- **Content Preservation**: Fixes only structural and formatting issues while maintaining original content
-- **Error Handling**: Comprehensive error handling with detailed logging
-- **Progress Monitoring**: Real-time progress tracking and notifications via Gotify
-- **Resume Capability**: Ability to resume processing from a specific batch ID
-- **Dry Run Mode**: Test connectivity without processing actual content
+- Batch processing of large markdown files using Anthropic's cost-effective Batch API
+- Preserves original German content while fixing:
+  - Markdown structural issues
+  - Hyphenation errors
+  - Formatting inconsistencies
+  - Line breaks and paragraph structures
+- Parallel processing of multiple files
+- Progress monitoring and notifications via Gotify
+- Resumable processing from existing batch IDs
+- Support for processing individual files or entire directories
+
+## Prerequisites
+
+- Python 3.8+
+- Anthropic API key
+- Gotify server for notifications
+- Required Python packages (see `requirements.txt`)
 
 ## Installation
 
-1. Clone the repository:
+1. Clone the repository
+2. Install dependencies:
 ```bash
-git clone https://github.com/yourusername/markdown-batch-processor.git
-cd markdown-batch-processor
+pip install -r requirements.txt
 ```
-
-2. Create and activate a virtual environment (recommended):
-```bash
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-```
-
-3. Install required dependencies:
-```bash
-pip install anthropic requests
-```
-
-4. Set up environment variables:
-```bash
-export ANTHROPIC_API_KEY="your-api-key"
-export GOTIFY_TOKEN="your-gotify-token"  # Optional
+3. Create a `.env` file with your credentials:
+```env
+ANTHROPIC_API_KEY=your_api_key
+GOTIFY_URL=your_gotify_url
+GOTIFY_TOKEN=your_gotify_token
+SYSTEM_PROMPT=your_custom_prompt  # Optional
 ```
 
 ## Usage
 
 ### Basic Usage
 
-Process a markdown file:
+Process a single file or directory:
 ```bash
-python processor.py --input path/to/your/file.md
+python main.py --input path/to/your/file_or_directory
 ```
 
-### Command Line Arguments
+### Additional Options
 
-```
---input          Required: Input markdown file path
---dry-run        Optional: Test connections without processing
---gotify-url     Optional: Gotify server URL (default: https://push.example.de)
---gotify-token   Optional: Gotify notification token
---api-key        Optional: Anthropic API key (can also use ANTHROPIC_API_KEY env variable)
---resume-batch   Optional: Resume processing from an existing batch ID
-```
-
-### Examples
-
-1. Run with all parameters:
+- Test connections without processing:
 ```bash
-python processor.py --input document.md --gotify-url https://your-gotify-server.com --gotify-token your-token --api-key your-api-key
+python main.py --input path/to/file --dry-run
 ```
 
-2. Test connections:
+- Resume from a previous batch:
 ```bash
-python processor.py --input document.md --dry-run
+python main.py --input output/path --resume-batch batch_id
 ```
 
-3. Resume from a batch:
+- Override environment variables:
 ```bash
-python processor.py --input document.md --resume-batch msgbatch_01HkcTjaV5uDC8jWR4ZsDV8d
+python main.py --input path/to/file --gotify-url URL --gotify-token TOKEN --api-key KEY
 ```
+
+## Code Structure Analysis
+
+### Strengths
+- Good separation of concerns with distinct classes and functions
+- Comprehensive error handling and notifications
+- Flexible file handling supporting both single files and directories
+- Efficient batch processing with proper chunking
+
+### Areas for Improvement
+
+1. **Error Handling**:
+   - Consider implementing retries for API calls
+   - Add more granular error types and handling
+   - Implement rate limiting handling
+
+2. **Code Duplication**:
+   - Consolidate notification logic into reusable functions
+   - Create a unified status tracking system
+   - Merge similar batch processing functions
+
+3. **Configuration**:
+   - Move hardcoded values to configuration
+   - Add support for different OCR/markdown processing strategies
+   - Implement configurable batch sizes and timing
+
+4. **Performance**:
+   - Optimize chunk size determination
+   - Implement smarter batch grouping
+   - Add caching for partially processed files
+
+## Environment Variables
+
+| Variable | Description | Required |
+|----------|-------------|-----------|
+| ANTHROPIC_API_KEY | Your Anthropic API key | Yes |
+| GOTIFY_URL | Gotify server URL | Yes |
+| GOTIFY_TOKEN | Gotify notification token | Yes |
+| SYSTEM_PROMPT | Custom system prompt for processing | No |
+
+## System Prompt
+
+The default system prompt is designed to:
+- Fix structural markdown issues
+- Correct hyphenation errors
+- Preserve original German content
+- Maintain original line breaks and paragraph structure
+- Remove interfering footnotes
+- Preserve image references
+
+You can customize the prompt by setting the `SYSTEM_PROMPT` environment variable.
+
+## Batch Processing Details
+
+- Maximum batch size: 10,000 requests
+- Processing time: Up to 24 hours
+- Cost: 50% cheaper than standard API calls
+- Models supported: Claude 3.5 Sonnet, Claude 3 Opus, Claude 3 Haiku
+
+## Error Handling and Recovery
+
+The tool implements several recovery mechanisms:
+1. Automatic batch status monitoring
+2. Progress saving and restoration
+3. Partial results recovery
+4. Batch processing resumption
 
 ## Notifications
 
-The script uses Gotify for notifications with different priority levels:
-- Priority 5: Information and status updates
-- Priority 7: Batch completion and warnings
-- Priority 8-9: Processing errors
-- Priority 10: Fatal errors
-
-## Error Handling
-
-- Comprehensive error catching and reporting
-- Partial results saving on failure
-- Detailed error messages with stack traces
-- Notification system for real-time error alerts
-
-## License
-
-MIT License
-
-Copyright (c) 2024
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+Notifications are sent via Gotify for:
+- Processing start/completion
+- Batch status updates
+- Errors and warnings
+- Hourly status updates
+- Final processing summary
 
 ## Contributing
 
-Contributions are welcome! Please feel free to submit a Pull Request. For major changes, please open an issue first to discuss what you would like to change.
-
 1. Fork the repository
-2. Create your feature branch (`git checkout -b feature/AmazingFeature`)
-3. Commit your changes (`git commit -m 'Add some AmazingFeature'`)
-4. Push to the branch (`git push origin feature/AmazingFeature`)
-5. Open a Pull Request
+2. Create a feature branch
+3. Commit your changes
+4. Push to the branch
+5. Create a Pull Request
 
-Please make sure to update tests as appropriate and follow the existing coding style.
+## License
+
+[Add your license information here]

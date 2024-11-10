@@ -11,6 +11,7 @@ from typing import List, Dict, Set, Optional
 from dataclasses import dataclass, field
 from anthropic.types.beta.message_create_params import MessageCreateParamsNonStreaming
 from anthropic.types.beta.messages.batch_create_params import Request
+from tenacity import retry, stop_after_attempt, wait_exponential
 
 load_dotenv()
 
@@ -269,6 +270,7 @@ def create_batch_requests(chunks: List[Dict[str, str]], model: str = "claude-3-5
         for i, chunk in enumerate(chunks)
     ]
 
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
 def submit_batches(chunks: List[Dict[str, str]], client: anthropic.Anthropic, input_file: str, notifier: GotifyNotifier, max_batch_size: int = 10000) -> List[BatchStatus]:
     """Submit all chunks in multiple batches if needed."""
     batches = []
